@@ -1,0 +1,21 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+.DS_Store
+
+.vscode/*
+Tennis_Linux/*
+
+Tennis_Windows_x86_64/*
+
+# Soccer environment (optional challenge, not submitted)
+soccer/
+.unity-environment.txt

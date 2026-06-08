@@ -1,0 +1,279 @@
+import tqdm.auto as tqdm
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch import nn
+from unityagents import UnityEnvironment
+from actor import Actor
+from critic import Critic
+import random
+from replay_buffer import ReplayBuffer
+import torch.optim as optim
+from collections import deque
+from typing import Deque
+
+BEST_ACTOR_PATH = "best_actor.pth"
+BEST_CRITIC_PATH = "best_critic.pth"
+
+
+class AgentHarness:
+
+    num_agents: int
+    actor: Actor
+    critic: Critic
+    target_actor: Actor
+    target_critic: Critic
+    replay_buffer: ReplayBuffer
+
+    discount_factor: float
+    ENV_STATE_DIM = 24
+
+    def __init__(
+        self,
+        replay_buffer_max_size: int,
+        score_window_max_size: int,
+        discount_factor: float,
+        actor_lr: float,
+        critic_lr: float,
+        replay_buffer_sample_size: int,
+        load_best: bool = False,
+    ) -> None:
+        self.num_agents = 2
+        self.actor = Actor(input_dim=self.ENV_STATE_DIM, output_dim=2)
+        self.target_actor = Actor(input_dim=self.ENV_STATE_DIM, output_dim=2)
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=actor_lr)
+
+        self.critic = Critic(observation_dim=self.ENV_STATE_DIM, action_dim=2)
+        self.target_critic = Critic(observation_dim=self.ENV_STATE_DIM, action_dim=2)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=critic_lr)
+
+        if load_best:
+            self.actor.load_state_dict(torch.load(BEST_ACTOR_PATH))
+            self.critic.load_state_dict(torch.load(BEST_CRITIC_PATH))
+
+        # Initialize target networks with the same weights as the main networks
+        self.target_actor.load_state_dict(self.actor.state_dict())
+        self.target_critic.load_state_dict(self.critic.state_dict())
+        self.replay_buffer_sample_size = replay_buffer_sample_size
+
+        self.replay_buffer = ReplayBuffer(max_size=replay_buffer_max_size)
+        self.score_window_max_size = score_window_max_size
+        self.discount_factor = discount_factor
+
+        self.actor_scheduler = optim.lr_scheduler.ExponentialLR(
+            self.actor_optimizer, gamma=0.999
+        )
+        self.critic_scheduler = optim.lr_scheduler.ExponentialLR(
+            self.critic_optimizer, gamma=0.999
+        )
+
+    def act(self, states: np.ndarray, noise_scale: float = 0.1) -> np.ndarray:
+        """
+        Select an action for each agent.
+        """
+        torch_states = torch.from_numpy(states).float()
+
+        with torch.no_grad():
+            actions = self.actor(torch_states).cpu().numpy()
+
+        actions += noise_scale * np.random.randn(*actions.shape)
+
+        # all actions between -1 and 1
+        return np.clip(actions, -1, 1)
+
+    def rollout(
+        self,
+        env: UnityEnvironment,
+        num_episodes: int,
+        max_train_steps_per_episode: int = 50,
+        exit_on_solve: bool = False,
+        noise_decay: float = 0.995,
+    ) -> Deque[float]:
+        """
+        Generate experience by interacting with the environment and store it in the replay buffer
+        for the specified number of episodes.
+        """
+        noise_scale = 1.0
+        noise_min = 0.05
+        score_window: Deque[float] = deque()
+        all_scores: Deque[float] = deque()
+        warmup_episodes = 50
+        best_avg_score = 0.0
+        avg_score = 0.0
+
+        with tqdm.trange(num_episodes, desc="Rollout") as pbar:
+
+            for ep_num in pbar:
+                brain_name = env.brain_names[0]
+                # reset the environment
+                env_info = env.reset(train_mode=True)[brain_name]
+                scores = np.zeros(
+                    self.num_agents
+                )  # initialize the score (for each agent)
+                # get the current state (for each agent)
+                states = env_info.vector_observations
+                episode_steps = 0
+
+                while True:
+                    if ep_num < warmup_episodes:
+                        actions = np.random.uniform(-1, 1, (self.num_agents, 2))
+                    else:
+                        actions = self.act(
+                            states, noise_scale=noise_scale
+                        )  # select an action (for each agent)
+                    # send all actions to tne environment
+                    env_info = env.step(actions)[brain_name]
+
+                    # get next state (for each agent)
+                    next_states = env_info.vector_observations
+                    rewards = env_info.rewards  # get reward (for each agent)
+                    dones = env_info.local_done  # see if episode finished
+
+                    for i in range(self.num_agents):
+                        self.replay_buffer.add_entry(
+                            obs=states[i],
+                            acts=actions[i],
+                            rewards=rewards[i],
+                            next_obs=next_states[i],
+                            done_flags=dones[i],
+                        )
+
+                    scores += rewards  # update the score (for each agent)
+                    states = next_states  # roll over states to next time step
+                    episode_steps += 1
+
+                    if np.any(dones):  # exit loop if episode finished
+                        break
+
+                # Train proportionally to episode length, capped at max
+                self.train(num_steps=min(episode_steps, max_train_steps_per_episode))
+
+                score = np.max(scores)
+                score_window.append(score)
+                all_scores.append(float(score))
+
+                if len(score_window) > self.score_window_max_size:
+                    score_window.popleft()
+
+                avg_score = np.mean(score_window)
+
+                # Decay exploration noise once policy shows any sign of learning
+                if avg_score > 0.01:
+                    noise_scale = max(noise_min, noise_scale * noise_decay)
+                avg_score = np.mean(score_window)
+
+                if avg_score >= 0.5:
+                    pbar.write(
+                        f"Environment solved at episode {ep_num + 1} with avg score {avg_score:.2f}!"
+                    )
+                    if exit_on_solve:
+                        break
+
+                if avg_score > best_avg_score:
+                    best_avg_score = avg_score
+                    torch.save(self.actor.state_dict(), BEST_ACTOR_PATH)
+                    torch.save(self.critic.state_dict(), BEST_CRITIC_PATH)
+
+                pbar.set_postfix(
+                    {"Avg100": f"{avg_score:.2f}", "Noise": f"{noise_scale:.3f}"}
+                )
+
+        return all_scores
+
+    def train(self, num_steps: int) -> None:
+        if len(self.replay_buffer) < self.replay_buffer_sample_size:
+            return
+        for step in range(num_steps):
+            buffer_samples = self.replay_buffer.sample(
+                batch_size=self.replay_buffer_sample_size
+            )
+
+            # Next action based on next state, predicted by target actor network
+            with torch.no_grad():
+                target_actor_action = self.target_actor(buffer_samples["next_obs"])
+
+                # Q targets for current states (y_i)
+                output_values = buffer_samples["rewards"].unsqueeze(
+                    1
+                ) + self.discount_factor * self.target_critic(
+                    buffer_samples["next_obs"], target_actor_action
+                ) * (
+                    1 - buffer_samples["done_flags"].unsqueeze(1)
+                )
+
+            # Get critic loss
+            expected_output = self.critic(buffer_samples["obs"], buffer_samples["acts"])
+            critic_loss = F.mse_loss(expected_output, output_values)
+            # Minimize the loss
+            self.critic_optimizer.zero_grad()
+            critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
+            self.critic_optimizer.step()
+
+            # Next, update the actor policy every other step:
+            if step % 2 == 0:
+                actor_prediction = self.actor(buffer_samples["obs"])
+                actor_loss = -self.critic(
+                    buffer_samples["obs"], actor_prediction
+                ).mean()
+
+                self.actor_optimizer.zero_grad()
+                actor_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
+                self.actor_optimizer.step()
+
+                # Soft updates
+                self.soft_update(self.actor, self.target_actor)
+                self.soft_update(self.critic, self.target_critic)
+
+        self.actor_scheduler.step()
+        self.critic_scheduler.step()
+
+    def soft_update(
+        self, net: nn.Module, target_net: nn.Module, interp_factor: float = 0.01
+    ) -> None:
+
+        for param, target_param in zip(net.parameters(), target_net.parameters()):
+            target_param.data.lerp_(param.data, interp_factor)
+
+    def test(self, env: UnityEnvironment, num_episodes: int) -> None:
+        brain_name = env.brain_names[0]
+        # brain = env.brains[brain_name]
+
+        for _ in tqdm.trange(num_episodes):
+            env_info = env.reset(train_mode=False)[brain_name]  # reset the environment
+            # get the current state (for each agent)
+            states = env_info.vector_observations
+            scores = np.zeros(self.num_agents)  # initialize the score (for each agent)
+            while True:
+                actions = self.act(states)  # select an action (for each agent)
+                # send all actions to tne environment
+                env_info = env.step(actions)[brain_name]
+
+                # get next state (for each agent)
+                next_states = env_info.vector_observations
+                rewards = env_info.rewards  # get reward (for each agent)
+                dones = env_info.local_done  # see if episode finished
+                scores += env_info.rewards  # update the score (for each agent)
+                states = next_states  # roll over states to next time step
+
+                if np.any(dones):  # exit loop if episode finished
+                    break
+
+
+def main() -> None:
+    path = R"C:\Users\eliot\Documents\GitHub\deep_rl_project_3\Tennis_Windows_x86_64\Tennis.exe"
+    env = UnityEnvironment(file_name=path, worker_id=1)
+
+    AgentHarness(
+        replay_buffer_max_size=100_000,
+        score_window_max_size=100,
+        discount_factor=0.99,
+        actor_lr=1e-4,
+        critic_lr=1e-3,
+        replay_buffer_sample_size=128,
+    ).rollout(env, num_episodes=10_000)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,12 @@
+name: deep_rl_p3
+channels:
+  - conda-forge
+dependencies:
+  - python=3.6
+  - pip
+  - pip:
+      - unityagents==0.4.0
+      - numpy<2.0
+      - jupyter
+      - torch
+      - tqdm

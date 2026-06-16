@@ -91,7 +91,7 @@ class AgentHarness:
         self,
         env: UnityEnvironment,
         num_episodes: int,
-        max_train_steps_per_episode: int = 100,
+        max_train_steps_per_episode: int = 50,
         exit_on_solve: bool = False,
         noise_decay: float = 0.995,
     ) -> Deque[float]:
@@ -258,7 +258,7 @@ class AgentHarness:
             # Minimize the loss
             self.critic_optimizer.zero_grad()
             critic_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=0.5)
             self.critic_optimizer.step()
             critic_losses.append(float(critic_loss.item()))
 

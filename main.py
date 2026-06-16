@@ -90,9 +90,10 @@ class AgentHarness:
         self,
         env: UnityEnvironment,
         num_episodes: int,
-        max_train_steps_per_episode: int = 100,
+        max_train_steps_per_episode: int = 150,
         exit_on_solve: bool = False,
         noise_decay: float = 0.995,
+        train_every_episodes: int = 5,
     ) -> Deque[float]:
         """
         Generate experience by interacting with the environment and store it in the replay buffer
@@ -105,6 +106,7 @@ class AgentHarness:
         warmup_episodes = 5
         best_avg_score = 0.0
         avg_score = 0.0
+        accumulated_steps = 0
 
         with tqdm.trange(num_episodes, desc="Rollout") as pbar:
 
@@ -159,10 +161,16 @@ class AgentHarness:
                     if np.any(dones):  # exit loop if episode finished
                         break
 
-                # Train proportionally to episode length, capped at max
-                train_metrics = self.train(
-                    num_steps=min(episode_steps, max_train_steps_per_episode)
-                )
+                # Accumulate steps and train every N episodes
+                accumulated_steps += episode_steps
+                if (ep_num + 1) % train_every_episodes == 0 or (ep_num + 1) == num_episodes:
+                    # Train proportionally to accumulated steps, capped at max
+                    train_metrics = self.train(
+                        num_steps=min(accumulated_steps, max_train_steps_per_episode)
+                    )
+                    accumulated_steps = 0
+                else:
+                    train_metrics = {"actor_loss": None, "critic_loss": None}
 
                 score = np.max(scores)
                 score_window.append(score)
@@ -314,7 +322,7 @@ def main() -> None:
         discount_factor=0.99,
         actor_lr=1e-4,
         critic_lr=1e-3,
-        replay_buffer_sample_size=128,
+        replay_buffer_sample_size=256,
     ).rollout(env, num_episodes=10_000)
 
 

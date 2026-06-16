@@ -9,7 +9,7 @@ from critic import Critic
 from replay_buffer import ReplayBuffer
 import torch.optim as optim
 from collections import deque
-from typing import Deque
+from typing import Deque, Optional, Dict
 
 BEST_ACTOR_PATH = "best_actor.pth"
 BEST_CRITIC_PATH = "best_critic.pth"
@@ -193,7 +193,7 @@ class AgentHarness:
                 mean_abs_action = action_mag_sum / max(episode_steps, 1)
                 mean_clip_fraction = clip_fraction_sum / max(clip_fraction_steps, 1)
 
-                def fmt_metric(value: float | None) -> str:
+                def fmt_metric(value: Optional[float]) -> str:
                     return "n/a" if value is None else f"{value:.3f}"
 
                 pbar.set_postfix(
@@ -209,7 +209,7 @@ class AgentHarness:
 
         return all_scores
 
-    def train(self, num_steps: int) -> dict[str, float | None]:
+    def train(self, num_steps: int) -> Dict[str, Optional[float]]:
         if len(self.replay_buffer) < self.replay_buffer_sample_size:
             return {"actor_loss": None, "critic_loss": None}
 

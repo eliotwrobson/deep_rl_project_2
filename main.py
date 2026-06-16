@@ -14,6 +14,7 @@ from typing import Deque
 
 BEST_ACTOR_PATH = "best_actor.pth"
 BEST_CRITIC_PATH = "best_critic.pth"
+OUTPUT_DIM = 4
 
 
 class AgentHarness:
@@ -39,14 +40,14 @@ class AgentHarness:
         load_best: bool = False,
     ) -> None:
         self.num_agents = 1
-        output_dim = 4
-        self.actor = Actor(input_dim=self.ENV_STATE_DIM, output_dim=output_dim)
-        self.target_actor = Actor(input_dim=self.ENV_STATE_DIM, output_dim=output_dim)
+
+        self.actor = Actor(input_dim=self.ENV_STATE_DIM, output_dim=OUTPUT_DIM)
+        self.target_actor = Actor(input_dim=self.ENV_STATE_DIM, output_dim=OUTPUT_DIM)
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=actor_lr)
 
-        self.critic = Critic(observation_dim=self.ENV_STATE_DIM, action_dim=output_dim)
+        self.critic = Critic(observation_dim=self.ENV_STATE_DIM, action_dim=OUTPUT_DIM)
         self.target_critic = Critic(
-            observation_dim=self.ENV_STATE_DIM, action_dim=output_dim
+            observation_dim=self.ENV_STATE_DIM, action_dim=OUTPUT_DIM
         )
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=critic_lr)
 
@@ -119,7 +120,9 @@ class AgentHarness:
 
                 while True:
                     if ep_num < warmup_episodes:
-                        actions = np.random.uniform(-1, 1, (self.num_agents, 2))
+                        actions = np.random.uniform(
+                            -1, 1, (self.num_agents, OUTPUT_DIM)
+                        )
                     else:
                         actions = self.act(
                             states, noise_scale=noise_scale

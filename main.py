@@ -6,7 +6,6 @@ from torch import nn
 from unityagents import UnityEnvironment
 from actor import Actor
 from critic import Critic
-import random
 from replay_buffer import ReplayBuffer
 import torch.optim as optim
 from collections import deque
@@ -70,6 +69,7 @@ class AgentHarness:
         self.critic_scheduler = optim.lr_scheduler.ExponentialLR(
             self.critic_optimizer, gamma=0.999
         )
+        self.last_action_clip_fraction = 0.0
 
     def act(self, states: np.ndarray, noise_scale: float = 0.1) -> np.ndarray:
         """
@@ -80,16 +80,17 @@ class AgentHarness:
         with torch.no_grad():
             actions = self.actor(torch_states).cpu().numpy()
 
-        actions += noise_scale * np.random.randn(*actions.shape)
+        noisy_actions = actions + noise_scale * np.random.randn(*actions.shape)
+        self.last_action_clip_fraction = float(np.mean(np.abs(noisy_actions) > 1.0))
 
         # all actions between -1 and 1
-        return np.clip(actions, -1, 1)
+        return np.clip(noisy_actions, -1, 1)
 
     def rollout(
         self,
         env: UnityEnvironment,
         num_episodes: int,
-        max_train_steps_per_episode: int = 50,
+        max_train_steps_per_episode: int = 100,
         exit_on_solve: bool = False,
         noise_decay: float = 0.995,
     ) -> Deque[float]:
@@ -97,11 +98,11 @@ class AgentHarness:
         Generate experience by interacting with the environment and store it in the replay buffer
         for the specified number of episodes.
         """
-        noise_scale = 1.0
-        noise_min = 0.05
+        noise_scale = 0.2
+        noise_min = 0.02
         score_window: Deque[float] = deque()
         all_scores: Deque[float] = deque()
-        warmup_episodes = 50
+        warmup_episodes = 5
         best_avg_score = 0.0
         avg_score = 0.0
 
@@ -117,6 +118,9 @@ class AgentHarness:
                 # get the current state (for each agent)
                 states = env_info.vector_observations
                 episode_steps = 0
+                action_mag_sum = 0.0
+                clip_fraction_sum = 0.0
+                clip_fraction_steps = 0
 
                 while True:
                     if ep_num < warmup_episodes:
@@ -127,6 +131,10 @@ class AgentHarness:
                         actions = self.act(
                             states, noise_scale=noise_scale
                         )  # select an action (for each agent)
+                        clip_fraction_sum += self.last_action_clip_fraction
+                        clip_fraction_steps += 1
+
+                    action_mag_sum += float(np.mean(np.abs(actions)))
                     # send all actions to tne environment
                     env_info = env.step(actions)[brain_name]
 
@@ -152,7 +160,9 @@ class AgentHarness:
                         break
 
                 # Train proportionally to episode length, capped at max
-                self.train(num_steps=min(episode_steps, max_train_steps_per_episode))
+                train_metrics = self.train(
+                    num_steps=min(episode_steps, max_train_steps_per_episode)
+                )
 
                 score = np.max(scores)
                 score_window.append(score)
@@ -164,8 +174,8 @@ class AgentHarness:
                 avg_score = np.mean(score_window)
 
                 # Decay exploration noise once policy shows any sign of learning
-                if avg_score > 0.01:
-                    noise_scale = max(noise_min, noise_scale * noise_decay)
+                # if avg_score > 0.01:
+                noise_scale = max(noise_min, noise_scale * noise_decay)
                 avg_score = np.mean(score_window)
 
                 if avg_score >= 0.5:
@@ -180,15 +190,32 @@ class AgentHarness:
                     torch.save(self.actor.state_dict(), BEST_ACTOR_PATH)
                     torch.save(self.critic.state_dict(), BEST_CRITIC_PATH)
 
+                mean_abs_action = action_mag_sum / max(episode_steps, 1)
+                mean_clip_fraction = clip_fraction_sum / max(clip_fraction_steps, 1)
+
+                def fmt_metric(value: float | None) -> str:
+                    return "n/a" if value is None else f"{value:.3f}"
+
                 pbar.set_postfix(
-                    {"Avg100": f"{avg_score:.2f}", "Noise": f"{noise_scale:.3f}"}
+                    {
+                        "Avg100": f"{avg_score:.2f}",
+                        "Noise": f"{noise_scale:.3f}",
+                        "CritLoss": fmt_metric(train_metrics["critic_loss"]),
+                        "ActLoss": fmt_metric(train_metrics["actor_loss"]),
+                        "|a|": f"{mean_abs_action:.3f}",
+                        "Clip%": f"{100.0 * mean_clip_fraction:.1f}",
+                    }
                 )
 
         return all_scores
 
-    def train(self, num_steps: int) -> None:
+    def train(self, num_steps: int) -> dict[str, float | None]:
         if len(self.replay_buffer) < self.replay_buffer_sample_size:
-            return
+            return {"actor_loss": None, "critic_loss": None}
+
+        actor_losses: list[float] = []
+        critic_losses: list[float] = []
+
         for step in range(num_steps):
             buffer_samples = self.replay_buffer.sample(
                 batch_size=self.replay_buffer_sample_size
@@ -215,6 +242,7 @@ class AgentHarness:
             critic_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
             self.critic_optimizer.step()
+            critic_losses.append(float(critic_loss.item()))
 
             # Next, update the actor policy every other step:
             if step % 2 == 0:
@@ -227,6 +255,7 @@ class AgentHarness:
                 actor_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
                 self.actor_optimizer.step()
+                actor_losses.append(float(actor_loss.item()))
 
                 # Soft updates
                 self.soft_update(self.actor, self.target_actor)
@@ -234,6 +263,15 @@ class AgentHarness:
 
         self.actor_scheduler.step()
         self.critic_scheduler.step()
+
+        return {
+            "actor_loss": (
+                float(np.mean(actor_losses)) if len(actor_losses) > 0 else None
+            ),
+            "critic_loss": (
+                float(np.mean(critic_losses)) if len(critic_losses) > 0 else None
+            ),
+        }
 
     def soft_update(
         self, net: nn.Module, target_net: nn.Module, interp_factor: float = 0.01
@@ -258,7 +296,6 @@ class AgentHarness:
 
                 # get next state (for each agent)
                 next_states = env_info.vector_observations
-                rewards = env_info.rewards  # get reward (for each agent)
                 dones = env_info.local_done  # see if episode finished
                 scores += env_info.rewards  # update the score (for each agent)
                 states = next_states  # roll over states to next time step

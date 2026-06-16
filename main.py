@@ -178,7 +178,7 @@ class AgentHarness:
                 noise_scale = max(noise_min, noise_scale * noise_decay)
                 avg_score = np.mean(score_window)
 
-                if avg_score >= 0.5:
+                if avg_score >= 30.0:
                     pbar.write(
                         f"Environment solved at episode {ep_num + 1} with avg score {avg_score:.2f}!"
                     )

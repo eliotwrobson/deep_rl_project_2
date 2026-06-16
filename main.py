@@ -36,6 +36,8 @@ class AgentHarness:
         actor_lr: float,
         critic_lr: float,
         replay_buffer_sample_size: int,
+        actor_action_l2_coef: float = 1e-3,
+        policy_delay: int = 2,
         load_best: bool = False,
     ) -> None:
         self.num_agents = 1
@@ -62,6 +64,8 @@ class AgentHarness:
         self.replay_buffer = ReplayBuffer(max_size=replay_buffer_max_size)
         self.score_window_max_size = score_window_max_size
         self.discount_factor = discount_factor
+        self.actor_action_l2_coef = actor_action_l2_coef
+        self.policy_delay = policy_delay
         self.last_action_clip_fraction = 0.0
         self.last_policy_saturation_fraction = 0.0
 
@@ -258,19 +262,25 @@ class AgentHarness:
             self.critic_optimizer.step()
             critic_losses.append(float(critic_loss.item()))
 
-            # DDPG usually updates actor and critic every training step.
-            actor_prediction = self.actor(buffer_samples["obs"])
-            actor_loss = -self.critic(buffer_samples["obs"], actor_prediction).mean()
+            # Delay policy updates to reduce overfitting to critic errors.
+            if step % self.policy_delay == 0:
+                actor_prediction = self.actor(buffer_samples["obs"])
+                actor_q_loss = -self.critic(
+                    buffer_samples["obs"], actor_prediction
+                ).mean()
+                # Keep actions away from permanent +/-1 saturation.
+                action_reg = self.actor_action_l2_coef * actor_prediction.pow(2).mean()
+                actor_loss = actor_q_loss + action_reg
 
-            self.actor_optimizer.zero_grad()
-            actor_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
-            self.actor_optimizer.step()
-            actor_losses.append(float(actor_loss.item()))
+                self.actor_optimizer.zero_grad()
+                actor_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
+                self.actor_optimizer.step()
+                actor_losses.append(float(actor_loss.item()))
 
-            # Soft updates
-            self.soft_update(self.actor, self.target_actor)
-            self.soft_update(self.critic, self.target_critic)
+                # Soft updates after policy update.
+                self.soft_update(self.actor, self.target_actor)
+                self.soft_update(self.critic, self.target_critic)
 
         return {
             "actor_loss": (
@@ -320,9 +330,11 @@ def main() -> None:
         replay_buffer_max_size=100_000,
         score_window_max_size=100,
         discount_factor=0.99,
-        actor_lr=1e-4,
+        actor_lr=3e-5,
         critic_lr=3e-4,
         replay_buffer_sample_size=100,
+        actor_action_l2_coef=1e-3,
+        policy_delay=2,
     ).rollout(env, num_episodes=10_000)
 
 

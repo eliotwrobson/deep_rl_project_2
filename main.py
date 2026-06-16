@@ -26,7 +26,7 @@ class AgentHarness:
     replay_buffer: ReplayBuffer
 
     discount_factor: float
-    ENV_STATE_DIM = 24
+    ENV_STATE_DIM = 33
 
     def __init__(
         self,
@@ -38,13 +38,16 @@ class AgentHarness:
         replay_buffer_sample_size: int,
         load_best: bool = False,
     ) -> None:
-        self.num_agents = 2
-        self.actor = Actor(input_dim=self.ENV_STATE_DIM, output_dim=2)
-        self.target_actor = Actor(input_dim=self.ENV_STATE_DIM, output_dim=2)
+        self.num_agents = 1
+        output_dim = 4
+        self.actor = Actor(input_dim=self.ENV_STATE_DIM, output_dim=output_dim)
+        self.target_actor = Actor(input_dim=self.ENV_STATE_DIM, output_dim=output_dim)
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=actor_lr)
 
-        self.critic = Critic(observation_dim=self.ENV_STATE_DIM, action_dim=2)
-        self.target_critic = Critic(observation_dim=self.ENV_STATE_DIM, action_dim=2)
+        self.critic = Critic(observation_dim=self.ENV_STATE_DIM, action_dim=output_dim)
+        self.target_critic = Critic(
+            observation_dim=self.ENV_STATE_DIM, action_dim=output_dim
+        )
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=critic_lr)
 
         if load_best:
@@ -262,7 +265,7 @@ class AgentHarness:
 
 
 def main() -> None:
-    path = R"C:\Users\eliot\Documents\GitHub\deep_rl_project_3\Tennis_Windows_x86_64\Tennis.exe"
+    path = R"C:\Users\eliot\Documents\GitHub\deep_rl_project_2\Reacher_Windows_x86_64\Reacher.exe"
     env = UnityEnvironment(file_name=path, worker_id=1)
 
     AgentHarness(

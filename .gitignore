@@ -12,10 +12,7 @@ wheels/
 .DS_Store
 
 .vscode/*
-Tennis_Linux/*
 
-Tennis_Windows_x86_64/*
+Reacher_Windows_x86_64/*
 
-# Soccer environment (optional challenge, not submitted)
-soccer/
 .unity-environment.txt

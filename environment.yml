@@ -1,4 +1,4 @@
-name: deep_rl_p3
+name: deep_rl_p2
 channels:
   - conda-forge
 dependencies:

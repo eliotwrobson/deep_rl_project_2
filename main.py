@@ -63,6 +63,7 @@ class AgentHarness:
         self.score_window_max_size = score_window_max_size
         self.discount_factor = discount_factor
         self.last_action_clip_fraction = 0.0
+        self.last_policy_saturation_fraction = 0.0
 
     def act(self, states: np.ndarray, noise_scale: float = 0.1) -> np.ndarray:
         """
@@ -72,6 +73,9 @@ class AgentHarness:
 
         with torch.no_grad():
             actions = self.actor(torch_states).cpu().numpy()
+
+        # How often the policy itself is near action bounds before exploration noise.
+        self.last_policy_saturation_fraction = float(np.mean(np.abs(actions) > 0.95))
 
         noisy_actions = actions + noise_scale * np.random.randn(*actions.shape)
         self.last_action_clip_fraction = float(np.mean(np.abs(noisy_actions) > 1.0))
@@ -91,8 +95,8 @@ class AgentHarness:
         Generate experience by interacting with the environment and store it in the replay buffer
         for the specified number of episodes.
         """
-        noise_scale = 0.2
-        noise_min = 0.02
+        noise_scale = 0.15
+        noise_min = 0.005
         score_window: Deque[float] = deque()
         all_scores: Deque[float] = deque()
         warmup_episodes = 5
@@ -116,6 +120,8 @@ class AgentHarness:
                 action_mag_sum = 0.0
                 clip_fraction_sum = 0.0
                 clip_fraction_steps = 0
+                policy_sat_sum = 0.0
+                policy_sat_steps = 0
 
                 while True:
                     if ep_num < warmup_episodes:
@@ -128,6 +134,8 @@ class AgentHarness:
                         )  # select an action (for each agent)
                         clip_fraction_sum += self.last_action_clip_fraction
                         clip_fraction_steps += 1
+                        policy_sat_sum += self.last_policy_saturation_fraction
+                        policy_sat_steps += 1
 
                     action_mag_sum += float(np.mean(np.abs(actions)))
                     # send all actions to tne environment
@@ -173,11 +181,6 @@ class AgentHarness:
 
                 avg_score = np.mean(score_window)
 
-                # Decay exploration noise once policy shows any sign of learning
-                # if avg_score > 0.01:
-                noise_scale = max(noise_min, noise_scale * noise_decay)
-                avg_score = np.mean(score_window)
-
                 if avg_score >= 30.0:
                     pbar.write(
                         f"Environment solved at episode {ep_num + 1} with avg score {avg_score:.2f}!"
@@ -192,6 +195,16 @@ class AgentHarness:
 
                 mean_abs_action = action_mag_sum / max(episode_steps, 1)
                 mean_clip_fraction = clip_fraction_sum / max(clip_fraction_steps, 1)
+                mean_policy_sat = policy_sat_sum / max(policy_sat_steps, 1)
+
+                # Adapt noise to keep clipping at a useful but not destructive level.
+                if mean_clip_fraction > 0.20:
+                    noise_scale = max(noise_min, noise_scale * 0.90)
+                elif mean_clip_fraction < 0.05:
+                    noise_scale = max(noise_min, noise_scale * 0.995)
+                else:
+                    noise_scale = max(noise_min, noise_scale * noise_decay)
+                avg_score = np.mean(score_window)
 
                 def fmt_metric(value: Optional[float]) -> str:
                     return "n/a" if value is None else f"{value:.3f}"
@@ -204,6 +217,7 @@ class AgentHarness:
                         "ActLoss": fmt_metric(train_metrics["actor_loss"]),
                         "|a|": f"{mean_abs_action:.3f}",
                         "Clip%": f"{100.0 * mean_clip_fraction:.1f}",
+                        "PolSat%": f"{100.0 * mean_policy_sat:.1f}",
                     }
                 )
 

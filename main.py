@@ -62,13 +62,6 @@ class AgentHarness:
         self.replay_buffer = ReplayBuffer(max_size=replay_buffer_max_size)
         self.score_window_max_size = score_window_max_size
         self.discount_factor = discount_factor
-
-        self.actor_scheduler = optim.lr_scheduler.ExponentialLR(
-            self.actor_optimizer, gamma=0.999
-        )
-        self.critic_scheduler = optim.lr_scheduler.ExponentialLR(
-            self.critic_optimizer, gamma=0.999
-        )
         self.last_action_clip_fraction = 0.0
 
     def act(self, states: np.ndarray, noise_scale: float = 0.1) -> np.ndarray:
@@ -90,10 +83,9 @@ class AgentHarness:
         self,
         env: UnityEnvironment,
         num_episodes: int,
-        max_train_steps_per_episode: int = 150,
+        max_train_steps_per_episode: int = 100,
         exit_on_solve: bool = False,
         noise_decay: float = 0.995,
-        train_every_episodes: int = 5,
     ) -> Deque[float]:
         """
         Generate experience by interacting with the environment and store it in the replay buffer
@@ -106,7 +98,8 @@ class AgentHarness:
         warmup_episodes = 5
         best_avg_score = 0.0
         avg_score = 0.0
-        accumulated_steps = 0
+        total_steps = 0
+        update_after = 1000  # Start training after 1000 steps collected
 
         with tqdm.trange(num_episodes, desc="Rollout") as pbar:
 
@@ -161,14 +154,13 @@ class AgentHarness:
                     if np.any(dones):  # exit loop if episode finished
                         break
 
-                # Accumulate steps and train every N episodes
-                accumulated_steps += episode_steps
-                if (ep_num + 1) % train_every_episodes == 0 or (ep_num + 1) == num_episodes:
-                    # Train proportionally to accumulated steps, capped at max
+                # Track total steps and train after warmup
+                total_steps += episode_steps
+                if total_steps >= update_after:
+                    # Train proportionally to episode length, capped at max
                     train_metrics = self.train(
-                        num_steps=min(accumulated_steps, max_train_steps_per_episode)
+                        num_steps=min(episode_steps, max_train_steps_per_episode)
                     )
-                    accumulated_steps = 0
                 else:
                     train_metrics = {"actor_loss": None, "critic_loss": None}
 
@@ -252,25 +244,19 @@ class AgentHarness:
             self.critic_optimizer.step()
             critic_losses.append(float(critic_loss.item()))
 
-            # Next, update the actor policy every other step:
-            if step % 2 == 0:
-                actor_prediction = self.actor(buffer_samples["obs"])
-                actor_loss = -self.critic(
-                    buffer_samples["obs"], actor_prediction
-                ).mean()
+            # DDPG usually updates actor and critic every training step.
+            actor_prediction = self.actor(buffer_samples["obs"])
+            actor_loss = -self.critic(buffer_samples["obs"], actor_prediction).mean()
 
-                self.actor_optimizer.zero_grad()
-                actor_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
-                self.actor_optimizer.step()
-                actor_losses.append(float(actor_loss.item()))
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
+            self.actor_optimizer.step()
+            actor_losses.append(float(actor_loss.item()))
 
-                # Soft updates
-                self.soft_update(self.actor, self.target_actor)
-                self.soft_update(self.critic, self.target_critic)
-
-        self.actor_scheduler.step()
-        self.critic_scheduler.step()
+            # Soft updates
+            self.soft_update(self.actor, self.target_actor)
+            self.soft_update(self.critic, self.target_critic)
 
         return {
             "actor_loss": (
@@ -282,7 +268,7 @@ class AgentHarness:
         }
 
     def soft_update(
-        self, net: nn.Module, target_net: nn.Module, interp_factor: float = 0.01
+        self, net: nn.Module, target_net: nn.Module, interp_factor: float = 0.001
     ) -> None:
 
         for param, target_param in zip(net.parameters(), target_net.parameters()):
@@ -321,8 +307,8 @@ def main() -> None:
         score_window_max_size=100,
         discount_factor=0.99,
         actor_lr=1e-4,
-        critic_lr=1e-3,
-        replay_buffer_sample_size=256,
+        critic_lr=3e-4,
+        replay_buffer_sample_size=100,
     ).rollout(env, num_episodes=10_000)
 
 

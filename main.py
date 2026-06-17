@@ -2,6 +2,7 @@ import tqdm.auto as tqdm
 import numpy as np
 import torch
 import torch.nn.functional as F
+import time
 from torch import nn
 from unityagents import UnityEnvironment
 from actor import Actor
@@ -18,12 +19,13 @@ OUTPUT_DIM = 4
 
 class AgentHarness:
 
-    num_agents: int
+    num_agents: Optional[int]
     actor: Actor
     critic: Critic
     target_actor: Actor
     target_critic: Critic
     replay_buffer: ReplayBuffer
+    device: torch.device
 
     discount_factor: float
     ENV_STATE_DIM = 33
@@ -38,9 +40,15 @@ class AgentHarness:
         replay_buffer_sample_size: int,
         actor_action_l2_coef: float = 3e-3,
         policy_delay: int = 3,
+        device: Optional[str] = None,
         load_best: bool = False,
     ) -> None:
         self.num_agents = None  # Will be detected from environment
+        self.device = torch.device(
+            device
+            if device is not None
+            else ("cuda" if torch.cuda.is_available() else "cpu")
+        )
 
         self.actor = Actor(input_dim=self.ENV_STATE_DIM, output_dim=OUTPUT_DIM)
         self.target_actor = Actor(input_dim=self.ENV_STATE_DIM, output_dim=OUTPUT_DIM)
@@ -52,9 +60,18 @@ class AgentHarness:
         )
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=critic_lr)
 
+        self.actor.to(self.device)
+        self.target_actor.to(self.device)
+        self.critic.to(self.device)
+        self.target_critic.to(self.device)
+
         if load_best:
-            self.actor.load_state_dict(torch.load(BEST_ACTOR_PATH))
-            self.critic.load_state_dict(torch.load(BEST_CRITIC_PATH))
+            self.actor.load_state_dict(
+                torch.load(BEST_ACTOR_PATH, map_location=self.device)
+            )
+            self.critic.load_state_dict(
+                torch.load(BEST_CRITIC_PATH, map_location=self.device)
+            )
 
         # Initialize target networks with the same weights as the main networks
         self.target_actor.load_state_dict(self.actor.state_dict())
@@ -73,7 +90,7 @@ class AgentHarness:
         """
         Select an action for each agent.
         """
-        torch_states = torch.from_numpy(states).float()
+        torch_states = torch.from_numpy(states).float().to(self.device)
 
         with torch.no_grad():
             actions = self.actor(torch_states).cpu().numpy()
@@ -91,9 +108,10 @@ class AgentHarness:
         self,
         env: UnityEnvironment,
         num_episodes: int,
-        max_train_steps_per_episode: int = 50,
         exit_on_solve: bool = False,
         noise_decay: float = 0.995,
+        learn_every: int = 20,
+        num_updates_per_learn: int = 20,
     ) -> Deque[float]:
         """
         Generate experience by interacting with the environment and store it in the replay buffer
@@ -109,6 +127,7 @@ class AgentHarness:
         avg_score = 0.0
         total_steps = 0
         update_after = 1000  # Start training after 1000 steps collected
+        step_count = 0  # Track steps within current episode for training triggers
 
         with tqdm.trange(num_episodes, desc="Rollout") as pbar:
 
@@ -116,7 +135,7 @@ class AgentHarness:
                 brain_name = env.brain_names[0]
                 # reset the environment
                 env_info = env.reset(train_mode=True)[brain_name]
-                
+
                 # Detect number of agents from environment on first episode
                 if self.num_agents is None:
                     self.num_agents = len(env_info.agents)
@@ -131,6 +150,10 @@ class AgentHarness:
                 clip_fraction_steps = 0
                 policy_sat_sum = 0.0
                 policy_sat_steps = 0
+                episode_env_time = 0.0
+                episode_train_time = 0.0
+                episode_actor_losses: list[float] = []
+                episode_critic_losses: list[float] = []
 
                 while True:
                     if ep_num < warmup_episodes:
@@ -148,7 +171,9 @@ class AgentHarness:
 
                     action_mag_sum += float(np.mean(np.abs(actions)))
                     # send all actions to tne environment
+                    env_step_start = time.perf_counter()
                     env_info = env.step(actions)[brain_name]
+                    episode_env_time += time.perf_counter() - env_step_start
 
                     # get next state (for each agent)
                     next_states = env_info.vector_observations
@@ -167,19 +192,38 @@ class AgentHarness:
                     scores += rewards  # update the score (for each agent)
                     states = next_states  # roll over states to next time step
                     episode_steps += 1
+                    step_count += 1
+
+                    # Trigger training every learn_every steps after warmup period
+                    if total_steps >= update_after and step_count % learn_every == 0:
+                        train_start = time.perf_counter()
+                        train_metrics = self.train(num_steps=num_updates_per_learn)
+                        episode_train_time += time.perf_counter() - train_start
+                        if train_metrics["actor_loss"] is not None:
+                            episode_actor_losses.append(train_metrics["actor_loss"])
+                        if train_metrics["critic_loss"] is not None:
+                            episode_critic_losses.append(train_metrics["critic_loss"])
 
                     if np.any(dones):  # exit loop if episode finished
                         break
 
-                # Track total steps and train after warmup
+                # Track total steps for warmup period
                 total_steps += episode_steps
-                if total_steps >= update_after:
-                    # Train proportionally to episode length, capped at max
-                    train_metrics = self.train(
-                        num_steps=min(episode_steps, max_train_steps_per_episode)
-                    )
-                else:
-                    train_metrics = {"actor_loss": None, "critic_loss": None}
+                step_count = 0  # Reset step counter for next episode
+
+                # Aggregate training metrics from this episode
+                train_metrics = {
+                    "actor_loss": (
+                        float(np.mean(episode_actor_losses))
+                        if len(episode_actor_losses) > 0
+                        else None
+                    ),
+                    "critic_loss": (
+                        float(np.mean(episode_critic_losses))
+                        if len(episode_critic_losses) > 0
+                        else None
+                    ),
+                }
 
                 score = np.mean(scores)
                 score_window.append(score)
@@ -205,6 +249,12 @@ class AgentHarness:
                 mean_abs_action = action_mag_sum / max(episode_steps, 1)
                 mean_clip_fraction = clip_fraction_sum / max(clip_fraction_steps, 1)
                 mean_policy_sat = policy_sat_sum / max(policy_sat_steps, 1)
+                measured_total_time = episode_env_time + episode_train_time
+                train_time_fraction = (
+                    episode_train_time / measured_total_time
+                    if measured_total_time > 0.0
+                    else 0.0
+                )
 
                 # Adapt noise to keep clipping useful and recover from saturated-policy plateaus.
                 if mean_policy_sat > 0.60 and avg_score < 20.0:
@@ -214,7 +264,9 @@ class AgentHarness:
                 elif mean_clip_fraction < 0.05:
                     noise_scale = min(noise_max, noise_scale * 1.01)
                 else:
-                    noise_scale = max(noise_min, min(noise_max, noise_scale * noise_decay))
+                    noise_scale = max(
+                        noise_min, min(noise_max, noise_scale * noise_decay)
+                    )
                 avg_score = np.mean(score_window)
 
                 def fmt_metric(value: Optional[float]) -> str:
@@ -229,6 +281,9 @@ class AgentHarness:
                         "|a|": f"{mean_abs_action:.3f}",
                         "Clip%": f"{100.0 * mean_clip_fraction:.1f}",
                         "PolSat%": f"{100.0 * mean_policy_sat:.1f}",
+                        "EnvSec": f"{episode_env_time:.2f}",
+                        "TrainSec": f"{episode_train_time:.2f}",
+                        "Train%": f"{100.0 * train_time_fraction:.1f}",
                     }
                 )
 
@@ -245,6 +300,10 @@ class AgentHarness:
             buffer_samples = self.replay_buffer.sample(
                 batch_size=self.replay_buffer_sample_size
             )
+            buffer_samples = {
+                k: (v.to(self.device) if torch.is_tensor(v) else v)
+                for k, v in buffer_samples.items()
+            }
 
             # Next action based on next state, predicted by target actor network
             with torch.no_grad():
@@ -311,6 +370,8 @@ class AgentHarness:
 
         for _ in tqdm.trange(num_episodes):
             env_info = env.reset(train_mode=False)[brain_name]  # reset the environment
+            if self.num_agents is None:
+                self.num_agents = len(env_info.agents)
             # get the current state (for each agent)
             states = env_info.vector_observations
             scores = np.zeros(self.num_agents)  # initialize the score (for each agent)

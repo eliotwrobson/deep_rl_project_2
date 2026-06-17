@@ -40,7 +40,7 @@ class AgentHarness:
         policy_delay: int = 3,
         load_best: bool = False,
     ) -> None:
-        self.num_agents = 1
+        self.num_agents = None  # Will be detected from environment
 
         self.actor = Actor(input_dim=self.ENV_STATE_DIM, output_dim=OUTPUT_DIM)
         self.target_actor = Actor(input_dim=self.ENV_STATE_DIM, output_dim=OUTPUT_DIM)
@@ -116,6 +116,10 @@ class AgentHarness:
                 brain_name = env.brain_names[0]
                 # reset the environment
                 env_info = env.reset(train_mode=True)[brain_name]
+                
+                # Detect number of agents from environment on first episode
+                if self.num_agents is None:
+                    self.num_agents = len(env_info.agents)
                 scores = np.zeros(
                     self.num_agents
                 )  # initialize the score (for each agent)
@@ -177,7 +181,7 @@ class AgentHarness:
                 else:
                     train_metrics = {"actor_loss": None, "critic_loss": None}
 
-                score = np.max(scores)
+                score = np.mean(scores)
                 score_window.append(score)
                 all_scores.append(float(score))
 
@@ -210,9 +214,7 @@ class AgentHarness:
                 elif mean_clip_fraction < 0.05:
                     noise_scale = min(noise_max, noise_scale * 1.01)
                 else:
-                    noise_scale = max(
-                        noise_min, min(noise_max, noise_scale * noise_decay)
-                    )
+                    noise_scale = max(noise_min, min(noise_max, noise_scale * noise_decay))
                 avg_score = np.mean(score_window)
 
                 def fmt_metric(value: Optional[float]) -> str:

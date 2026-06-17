@@ -36,8 +36,8 @@ class AgentHarness:
         actor_lr: float,
         critic_lr: float,
         replay_buffer_sample_size: int,
-        actor_action_l2_coef: float = 1e-3,
-        policy_delay: int = 2,
+        actor_action_l2_coef: float = 3e-3,
+        policy_delay: int = 3,
         load_best: bool = False,
     ) -> None:
         self.num_agents = 1
@@ -100,7 +100,8 @@ class AgentHarness:
         for the specified number of episodes.
         """
         noise_scale = 0.15
-        noise_min = 0.005
+        noise_min = 0.02
+        noise_max = 0.25
         score_window: Deque[float] = deque()
         all_scores: Deque[float] = deque()
         warmup_episodes = 5
@@ -201,13 +202,17 @@ class AgentHarness:
                 mean_clip_fraction = clip_fraction_sum / max(clip_fraction_steps, 1)
                 mean_policy_sat = policy_sat_sum / max(policy_sat_steps, 1)
 
-                # Adapt noise to keep clipping at a useful but not destructive level.
-                if mean_clip_fraction > 0.20:
-                    noise_scale = max(noise_min, noise_scale * 0.90)
+                # Adapt noise to keep clipping useful and recover from saturated-policy plateaus.
+                if mean_policy_sat > 0.60 and avg_score < 20.0:
+                    noise_scale = min(noise_max, noise_scale * 1.05)
+                elif mean_clip_fraction > 0.20:
+                    noise_scale = max(noise_min, noise_scale * 0.95)
                 elif mean_clip_fraction < 0.05:
-                    noise_scale = max(noise_min, noise_scale * 0.995)
+                    noise_scale = min(noise_max, noise_scale * 1.01)
                 else:
-                    noise_scale = max(noise_min, noise_scale * noise_decay)
+                    noise_scale = max(
+                        noise_min, min(noise_max, noise_scale * noise_decay)
+                    )
                 avg_score = np.mean(score_window)
 
                 def fmt_metric(value: Optional[float]) -> str:

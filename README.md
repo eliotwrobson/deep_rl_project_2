@@ -38,7 +38,7 @@ conda env create -f environment.yml
 Then activate the environment:
 
 ```bash
-conda activate deep_rl_p3
+conda activate deep_rl_p2
 ```
 
 ## Running the Project
